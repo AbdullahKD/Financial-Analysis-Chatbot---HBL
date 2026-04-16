@@ -3,6 +3,17 @@ from db_insert import get_connection
 
 _conn = None
 
+MONETARY_COLS = {
+    "revenue", "gross_profit", "operating_profit", "profit_before_tax",
+    "net_profit", "cost_of_goods_sold", "operating_expenses", "depreciation",
+    "finance_cost", "tax_expense", "total_assets", "current_assets",
+    "non_current_assets", "cash_balance", "trade_receivables", "inventory",
+    "total_liabilities", "current_liabilities", "non_current_liabilities",
+    "total_equity", "share_capital", "long_term_debt", "gross_turnover",
+    "operating_cashflow", "investing_cashflow", "financing_cashflow",
+    "dividend_per_share"
+}
+
 def get_conn():
     global _conn
     if _conn is None or _conn.closed:
@@ -20,20 +31,24 @@ def run_query(sql: str):
         cur.close()
         return {"columns": colnames, "rows": rows}
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return {"error": str(e)}
 
 
-def get_all_years(company: str = "Bestway Cement") -> list[int]:
+def get_all_years(company: str = "Bestway Cement") -> list:
     result = run_query(f"SELECT DISTINCT year FROM financials WHERE company = '{company}' ORDER BY year DESC")
     if "rows" in result:
         return [r[0] for r in result["rows"]]
     return []
 
 
-def get_financial_context(company: str = "Bestway Cement", years: list[int] = None) -> str:
+def get_financial_context(company: str = "Bestway Cement", years: list = None) -> str:
     """
-    Returns a structured text summary of all available financial data for a company.
-    This is injected into the LLM prompt for analytical questions.
+    Returns structured financial data for LLM prompts.
+    All monetary figures are clearly labelled as PKR thousands.
     """
     if years is None:
         years = get_all_years(company)
@@ -54,7 +69,7 @@ def get_financial_context(company: str = "Bestway Cement", years: list[int] = No
     cols = result["columns"]
     rows = result["rows"]
 
-    lines = [f"=== Financial Data: {company} ===\n"]
+    lines = [f"=== Financial Data: {company} (all monetary figures in PKR thousands) ===\n"]
 
     for row in rows:
         record = dict(zip(cols, row))
@@ -64,9 +79,11 @@ def get_financial_context(company: str = "Bestway Cement", years: list[int] = No
                 continue
             val = record.get(col)
             if val is not None:
-                # Format numbers with commas
                 if isinstance(val, float):
-                    lines.append(f"  {col}: {val:,.2f}")
+                    if col in MONETARY_COLS:
+                        lines.append(f"  {col}: PKR {val:,.2f} thousand")
+                    else:
+                        lines.append(f"  {col}: {val:,.2f}")
                 else:
                     lines.append(f"  {col}: {val}")
         lines.append("")

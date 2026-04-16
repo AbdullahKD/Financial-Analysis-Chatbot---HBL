@@ -228,12 +228,29 @@ Financial statement text:
 """
 
 
-def extract_page_with_llm(page_text: str) -> dict | None:
-    prompt = EXTRACTION_PROMPT + page_text
+def extract_page_with_llm(page_text: str, attempt: int = 1) -> dict | None:
+    """
+    Fix 4: Retry logic — up to 2 attempts.
+    Second attempt uses a simpler, more constrained prompt.
+    """
+    if attempt == 1:
+        prompt = EXTRACTION_PROMPT + page_text
+    else:
+        # Simpler fallback prompt for retry
+        prompt = """Extract financial figures from this text. Return ONLY JSON, no explanation.
+Format: {"period_current": "date", "period_prior": "date", "items": {"A": {"name": "item name", "current": number, "prior": number}}}
+Numbers in brackets are negative. Extract every line item with a number.
+
+Text:
+""" + page_text[:2000]  # truncate for retry
+
     raw = call_ollama(prompt)
     raw = re.sub(r"```json|```", "", raw).strip()
     match = re.search(r"\{.+\}", raw, re.DOTALL)
     if not match:
+        if attempt < 2:
+            print(f"     Retry attempt {attempt + 1}...")
+            return extract_page_with_llm(page_text, attempt + 1)
         return None
     try:
         return json.loads(match.group())
@@ -242,6 +259,9 @@ def extract_page_with_llm(page_text: str) -> dict | None:
         try:
             return json.loads(fixed)
         except Exception:
+            if attempt < 2:
+                print(f"     JSON parse failed, retry attempt {attempt + 1}...")
+                return extract_page_with_llm(page_text, attempt + 1)
             return None
 
 
