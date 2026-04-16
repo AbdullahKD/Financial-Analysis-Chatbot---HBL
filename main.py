@@ -12,10 +12,10 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
-from extract_pdf import extract_text, extract_financials
+from extract_pdf import extract_text_only as extract_text, extract_financials, extract_financials_intelligent
 from db_insert import insert_financials
 from db_query import run_query, get_all_years
-from LLM_SQL import answer, classify_level, LEVEL_LABELS, is_detail_request
+from LLM_SQL import answer, store_pdf_text, invalidate_cache, LEVEL_LABELS
 
 app = FastAPI(title="HBL Financial Analyst", version="2.0")
 
@@ -28,7 +28,7 @@ app.add_middleware(
 
 
 class HistoryMessage(BaseModel):
-    role: str   # "user" or "analyst"
+    role: str
     content: str
 
 
@@ -74,34 +74,56 @@ async def upload_pdf(file: UploadFile = File(...), company: str = "Bestway Cemen
         tmp_path = tmp.name
 
     try:
-        text = extract_text(tmp_path)
-        data = extract_financials(text)
+        # Phase 1-4: Intelligent extraction with Mistral + validation
+        result = extract_financials_intelligent(tmp_path)
 
-        if not data:
-            raise HTTPException(status_code=422, detail="No financial data could be extracted from this PDF.")
+        current  = result["current"]
+        prior    = result["prior"]
+        meta     = result["metadata"]
+        raw_text = result["raw_text"]
 
-        # Use company name from UI, not from PDF (PDF titles are messy)
-        # company = data.get("_company", company)
-        period  = data.get("_period", "FY 2025")
-        year    = int(re.search(r"\d{4}", period).group()) if re.search(r"\d{4}", period) else 2025
+        if not current:
+            raise HTTPException(status_code=422, detail="No financial data could be extracted. Check that the PDF contains financial statements.")
 
-        current = {k: v for k, v in data.items() if not k.startswith("prior_") and not k.startswith("_")}
-        prior   = {k.replace("prior_", ""): v for k, v in data.items() if k.startswith("prior_")}
+        # Store full PDF text for qualitative Q&A
+        store_pdf_text(company, raw_text)
+        # Invalidate context cache so next query gets fresh data
+        invalidate_cache(company)
 
-        insert_financials(current, company=company, year=year, period=period)
+        # Determine year from extracted period
+        period_str = meta.get("period_current") or "31 December 2025"
+        year_match = re.search(r"\d{4}", period_str)
+        year = int(year_match.group()) if year_match else 2025
+        period_label = f"H1 FY{year}"
+
+        insert_financials(current, company=company, year=year, period=period_label)
 
         prior_inserted = False
         if prior:
-            insert_financials(prior, company=company, year=year - 1, period=f"FY {year - 1}")
+            prior_str = meta.get("period_prior") or str(year - 1)
+            prior_year_match = re.search(r"\d{4}", prior_str)
+            prior_year = int(prior_year_match.group()) if prior_year_match else year - 1
+            insert_financials(prior, company=company, year=prior_year, period=f"H1 FY{prior_year}")
             prior_inserted = True
+
+        # Build validation summary for response
+        validation = meta.get("validation", {})
+        passed = len(validation.get("passed", []))
+        failed = len(validation.get("failed", []))
 
         return {
             "status": "success",
             "company": company,
-            "period": period,
+            "period": period_label,
             "fields_extracted": len(current),
             "prior_year_extracted": prior_inserted,
             "extracted_fields": list(current.keys()),
+            "validation": {
+                "checks_passed": passed,
+                "checks_failed": failed,
+                "warnings": validation.get("warnings", []),
+                "failed_checks": validation.get("failed", [])
+            }
         }
 
     finally:
@@ -116,18 +138,15 @@ def chat(req: ChatRequest):
     # Build history string from last few exchanges
     history = ""
     if req.history:
-        for msg in req.history[-6:]:  # last 3 exchanges (6 messages)
+        for msg in req.history[-6:]:
             role = "User" if msg.role == "user" else "Analyst"
             history += f"{role}: {msg.content}\n\n"
 
-    level = 0 if (is_detail_request(req.question) and history) else classify_level(req.question)
-    level_label = "Detail Follow-up" if level == 0 else LEVEL_LABELS[level]
-
-    response = answer(req.question, req.company, history)
+    response_text, level, level_label = answer(req.question, req.company, history)
 
     return ChatResponse(
-        answer=response,
-        level=level if level != 0 else 4,
+        answer=response_text,
+        level=level,
         level_label=level_label,
         question=req.question,
     )

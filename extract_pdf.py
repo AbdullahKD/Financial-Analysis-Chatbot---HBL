@@ -1,10 +1,33 @@
-import pdfplumber
+"""
+extract_pdf.py — Intelligent PDF extraction using Mistral:7b + deterministic validation
+"""
+
+import json
 import re
+import subprocess
+import pdfplumber
 
 
-# ── Text Extraction ────────────────────────────────────────────────────────────
+# ── Model config ───────────────────────────────────────────────────────────────
+EXTRACTION_MODEL = "mistral:7b"
+FALLBACK_MODEL   = "llama3:8b"
 
-def extract_text(pdf_path: str) -> str:
+
+# ── Ollama call ────────────────────────────────────────────────────────────────
+
+def call_ollama(prompt: str, model: str = EXTRACTION_MODEL) -> str:
+    result = subprocess.run(
+        ["ollama", "run", model],
+        input=prompt.encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    return result.stdout.decode().strip()
+
+
+# ── PDF text extraction ────────────────────────────────────────────────────────
+
+def extract_text_only(pdf_path: str) -> str:
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -14,225 +37,503 @@ def extract_text(pdf_path: str) -> str:
     return text
 
 
-# ── Pattern helpers ────────────────────────────────────────────────────────────
+def extract_pages(pdf_path: str) -> list:
+    pages = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if text and len(text.strip()) > 50:
+                pages.append({"page": i + 1, "text": text})
+    return pages
 
-def _find(pattern: str, text: str, flags=re.IGNORECASE) -> float | None:
-    match = re.search(pattern, text, flags)
-    if match:
-        raw = match.group(1).replace(",", "").replace(" ", "")
+
+# ── Page classifier ────────────────────────────────────────────────────────────
+
+FINANCIAL_KEYWORDS = [
+    # Revenue & Sales
+    "turnover", "revenue", "net revenue", "gross revenue", "net sales", "gross sales",
+    "net turnover", "gross turnover", "total revenue", "total sales", "sales revenue",
+    "operating revenue", "service revenue", "fee income", "interest income",
+    "rental income", "dividend income", "other income", "income from operations",
+    "rebates", "discounts", "excise duty", "sales tax",
+
+    # Profitability
+    "gross profit", "gross loss", "operating profit", "operating loss",
+    "profit from operations", "profit before tax", "profit after tax",
+    "profit before taxation", "profit for the period", "profit for the year",
+    "net profit", "net loss", "loss for the period", "loss before tax",
+    "ebit", "ebitda", "operating income", "operating margin",
+    "profit attributable", "earnings", "retained earnings", "retained profit",
+    "comprehensive income", "total comprehensive income",
+
+    # Costs & Expenses
+    "cost of sales", "cost of goods sold", "cost of revenue", "cost of services",
+    "cost of production", "direct costs", "indirect costs",
+    "gross expenses", "operating expenses", "total expenses",
+    "selling expenses", "selling and distribution", "distribution expenses",
+    "administrative expenses", "general and administrative", "general expenses",
+    "other operating expenses", "other expenses", "miscellaneous expenses",
+    "research and development", "r&d expenses",
+    "depreciation", "amortisation", "amortization", "depletion",
+    "impairment", "impairment loss", "write-off", "write-down",
+    "provision", "provisions", "allowance", "bad debt",
+    "finance cost", "finance costs", "financial charges", "interest expense",
+    "interest charges", "mark-up", "markup expense", "borrowing costs",
+    "exchange loss", "exchange gain", "foreign exchange",
+    "royalty", "royalties", "licence fee",
+    "insurance", "repair and maintenance", "utilities", "rent expense",
+    "employee benefits", "staff costs", "salaries", "wages", "remuneration",
+    "gratuity", "provident fund", "pension",
+    "taxation", "income tax", "income tax expense", "deferred tax",
+    "current tax", "tax charge", "withholding tax",
+
+    # Balance Sheet — Assets
+    "total assets", "net assets", "non-current assets", "current assets",
+    "fixed assets", "property, plant", "plant and equipment", "ppe",
+    "capital work in progress", "cwip", "right of use", "lease asset",
+    "intangible assets", "goodwill", "intangibles",
+    "investment property", "long term investments", "long-term investments",
+    "investments in associates", "investments in subsidiaries",
+    "equity accounted", "available for sale", "held to maturity",
+    "long term loans", "long term deposits", "long-term deposits",
+    "deferred tax asset", "advance tax", "tax refundable",
+    "stock in trade", "inventories", "inventory", "stores and spares",
+    "spare parts", "work in progress", "finished goods", "raw materials",
+    "trade debts", "trade receivables", "accounts receivable",
+    "other receivables", "advances", "prepayments", "deposits",
+    "short term investments", "short-term investments",
+    "cash and bank", "cash and cash equivalents", "bank balances",
+    "cash in hand", "bank deposits",
+
+    # Balance Sheet — Liabilities
+    "total liabilities", "non-current liabilities", "current liabilities",
+    "long term financing", "long-term financing", "long term debt",
+    "long-term debt", "long term borrowings", "long-term borrowings",
+    "term finance", "sukuk", "bonds payable", "debentures",
+    "lease liabilities", "finance lease", "operating lease",
+    "deferred tax liability", "deferred income", "government grant",
+    "employee benefit obligations", "retirement benefits",
+    "short term borrowings", "short-term borrowings", "running finance",
+    "export refinancing", "demand finance", "overdraft",
+    "trade and other payables", "trade payables", "accounts payable",
+    "accrued liabilities", "accrued expenses", "accruals",
+    "current portion", "dividend payable", "unclaimed dividend",
+    "unpaid dividend", "advance from customers", "contract liabilities",
+    "income tax payable", "sales tax payable", "withholding tax payable",
+    "contingencies", "commitments",
+
+    # Equity
+    "total equity", "shareholders equity", "stockholders equity",
+    "owners equity", "net worth",
+    "share capital", "paid up capital", "authorised capital",
+    "ordinary shares", "preference shares", "share premium",
+    "capital reserve", "revenue reserve", "general reserve",
+    "statutory reserve", "surplus on revaluation",
+    "revaluation surplus", "revaluation reserve",
+    "exchange translation reserve", "hedging reserve",
+    "unappropriated profit", "accumulated profit", "accumulated deficit",
+
+    # Cash Flow
+    "net cash", "cash flows", "cash generated",
+    "operating activities", "investing activities", "financing activities",
+    "cash from operations", "cash used in operations",
+    "capital expenditure", "capex", "purchase of property",
+    "proceeds from disposal", "proceeds from sale",
+    "dividend paid", "dividend received",
+    "proceeds from financing", "repayment of financing",
+    "repayment of borrowings", "proceeds from borrowings",
+    "interest paid", "finance cost paid", "tax paid",
+    "net increase in cash", "net decrease in cash",
+    "cash at beginning", "cash at end", "cash equivalents",
+
+    # Per Share & Returns
+    "earnings per share", "eps", "basic eps", "diluted eps",
+    "dividend per share", "dps", "book value per share",
+    "net asset value per share", "nav per share",
+    "return on equity", "roe", "return on assets", "roa",
+    "return on capital", "roce",
+
+    # Ratios & Analysis
+    "current ratio", "quick ratio", "acid test",
+    "debt to equity", "gearing ratio", "leverage ratio",
+    "interest coverage", "debt service coverage",
+    "gross margin", "net margin", "operating margin", "ebitda margin",
+    "asset turnover", "inventory turnover", "receivables turnover",
+    "price to earnings", "p/e ratio", "price to book",
+
+    # Audit & Governance
+    "auditor", "auditors report", "audit report", "audited",
+    "unaudited", "reviewed", "independent auditor",
+    "chartered accountants", "engagement partner",
+    "going concern", "material uncertainty", "emphasis of matter",
+    "qualified opinion", "unqualified opinion",
+    "board of directors", "directors report", "chairman",
+    "chief executive", "managing director", "chief financial officer",
+    "company secretary", "audit committee",
+
+    # Notes & Policies
+    "accounting policy", "accounting policies", "significant accounting",
+    "basis of preparation", "basis of measurement",
+    "ifrs", "ias", "gaap", "iasb", "financial reporting standards",
+    "fair value", "historical cost", "carrying amount", "carrying value",
+    "recoverable amount", "value in use",
+    "related party", "related parties", "associated company",
+    "subsidiary", "subsidiaries", "holding company", "parent company",
+    "segment", "operating segment", "reportable segment",
+    "subsequent event", "events after", "post balance sheet",
+    "contingent liability", "contingent asset",
+    "capital management", "financial risk", "market risk",
+    "credit risk", "liquidity risk", "interest rate risk",
+    "currency risk", "foreign exchange risk",
+]
+
+
+def is_financial_page(text: str) -> bool:
+    t = text.lower()
+    hits = sum(1 for kw in FINANCIAL_KEYWORDS if kw in t)
+    return hits >= 1
+
+
+# ── Phase 2: LLM extraction ────────────────────────────────────────────────────
+
+EXTRACTION_PROMPT = """You are a financial data extraction expert. Extract ALL financial figures from the statement below.
+
+RULES:
+- Return ONLY valid JSON, no explanation, no markdown, no backticks
+- Assign a letter label to each line item: A, B, C, D... AA, AB...
+- Extract BOTH current period and prior period values where shown
+- CRITICAL: Check the document header for the unit scale (Rupees in thousands / millions / billions)
+  - If "Rupees in thousands" or "000": extract numbers as-is
+  - If "Rupees in millions" or "Rs. million": multiply all numbers by 1000 before storing
+  - If "Rupees in billions": multiply all numbers by 1000000 before storing
+  - Always store final values in THOUSANDS regardless of source unit
+- Bracketed numbers like (2,901,939) are negative - store as negative
+- If a value is missing, use null
+- Include ALL line items you can find, do not skip any
+
+Return this exact JSON structure:
+{
+  "period_current": "e.g. 31 December 2025",
+  "period_prior": "e.g. 31 December 2024",
+  "currency": "PKR",
+  "unit": "thousands",
+  "source_unit": "thousands or millions or billions - what the document uses",
+  "items": {
+    "A": {"name": "line item name exactly as written", "current": number_or_null, "prior": number_or_null},
+    "B": {"name": "line item name exactly as written", "current": number_or_null, "prior": number_or_null}
+  }
+}
+
+Financial statement text:
+"""
+
+
+def extract_page_with_llm(page_text: str) -> dict | None:
+    prompt = EXTRACTION_PROMPT + page_text
+    raw = call_ollama(prompt)
+    raw = re.sub(r"```json|```", "", raw).strip()
+    match = re.search(r"\{.+\}", raw, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group())
+    except json.JSONDecodeError:
+        fixed = match.group().replace("'", '"').replace("None", "null").replace("True", "true").replace("False", "false")
         try:
-            return float(raw)
-        except ValueError:
+            return json.loads(fixed)
+        except Exception:
             return None
-    return None
 
 
-def _find_two(pattern: str, text: str) -> tuple[float | None, float | None]:
-    """Find a row with two numbers (current period + prior period)."""
-    match = re.search(pattern, text, re.IGNORECASE)
-    if match:
-        def clean(s): return float(s.replace(",", "").replace(" ", ""))
-        try:
-            a = clean(match.group(1))
-            b = clean(match.group(2)) if match.lastindex >= 2 else None
-            return a, b
-        except (ValueError, AttributeError):
-            pass
-    return None, None
+# ── Phase 3: Map LLM items to DB fields ───────────────────────────────────────
+
+FIELD_MAPPING = {
+    "gross turnover":                               "gross_turnover",
+    "net turnover":                                 "revenue",
+    "net revenue":                                  "revenue",
+    "net sales":                                    "revenue",
+    "total revenue":                                "revenue",
+    "revenue":                                      "revenue",
+    "gross profit":                                 "gross_profit",
+    "operating profit":                             "operating_profit",
+    "profit from operations":                       "operating_profit",
+    "ebit":                                         "operating_profit",
+    "profit before tax":                            "profit_before_tax",
+    "profit before taxation":                       "profit_before_tax",
+    "profit for the period":                        "net_profit",
+    "profit for the year":                          "net_profit",
+    "profit after tax":                             "net_profit",
+    "net profit":                                   "net_profit",
+    "earnings per share":                           "eps",
+    "basic and diluted":                            "eps",
+    "eps":                                          "eps",
+    "dividend per share":                           "dividend_per_share",
+    "cost of sales":                                "cost_of_goods_sold",
+    "cost of goods sold":                           "cost_of_goods_sold",
+    "selling and distribution":                     "operating_expenses",
+    "administrative expenses":                      "operating_expenses",
+    "depreciation":                                 "depreciation",
+    "finance cost":                                 "finance_cost",
+    "finance costs":                                "finance_cost",
+    "financial charges":                            "finance_cost",
+    "income tax expense":                           "tax_expense",
+    "taxation":                                     "tax_expense",
+    "total assets":                                 "total_assets",
+    "current assets":                               "current_assets",
+    "non-current assets":                           "non_current_assets",
+    "non current assets":                           "non_current_assets",
+    "cash and bank balances":                       "cash_balance",
+    "cash and cash equivalents":                    "cash_balance",
+    "trade debts":                                  "trade_receivables",
+    "trade receivables":                            "trade_receivables",
+    "stock in trade":                               "inventory",
+    "inventories":                                  "inventory",
+    "total liabilities":                            "total_liabilities",
+    "current liabilities":                          "current_liabilities",
+    "non-current liabilities":                      "non_current_liabilities",
+    "non current liabilities":                      "non_current_liabilities",
+    "total equity":                                 "total_equity",
+    "share capital":                                "share_capital",
+    "long term financing":                          "long_term_debt",
+    "long-term financing":                          "long_term_debt",
+    "long term borrowings":                         "long_term_debt",
+    "net cash generated from operating activities": "operating_cashflow",
+    "net cash from operating activities":           "operating_cashflow",
+    "net cash generated from investing":            "investing_cashflow",
+    "net cash used in investing":                   "investing_cashflow",
+    "net cash used in financing":                   "financing_cashflow",
+    "net cash from financing":                      "financing_cashflow",
+}
 
 
-NUM = r"([\d,]+(?:\.\d+)?)"   # matches numbers like 1,234,567 or 1234567.89
+def map_items_to_fields(items: dict) -> tuple:
+    current = {}
+    prior = {}
+
+    for label, item in items.items():
+        name = item.get("name", "").lower().strip()
+        cur_val = item.get("current")
+        pri_val = item.get("prior")
+
+        matched_field = None
+        best_score = 0
+
+        for pattern, field in FIELD_MAPPING.items():
+            if pattern in name:
+                score = len(pattern)
+                if score > best_score:
+                    best_score = score
+                    matched_field = field
+
+        if matched_field and cur_val is not None:
+            if matched_field not in current:
+                current[matched_field] = float(cur_val)
+        if matched_field and pri_val is not None:
+            if matched_field not in prior:
+                prior[matched_field] = float(pri_val)
+
+    return current, prior
 
 
-# ── Main extractor ─────────────────────────────────────────────────────────────
+# ── Phase 4: Deterministic validation ─────────────────────────────────────────
+
+def within_tolerance(a: float, b: float, pct: float = 0.02) -> bool:
+    if a == 0 and b == 0:
+        return True
+    if a == 0 or b == 0:
+        return abs(a - b) < 1000
+    return abs(a - b) / max(abs(a), abs(b)) <= pct
+
+
+def validate_financials(data: dict) -> dict:
+    passed = []
+    failed = []
+    warnings = []
+
+    def check(name: str, computed: float, stored: float, tolerance: float = 0.02):
+        if within_tolerance(computed, stored, tolerance):
+            passed.append(name)
+        else:
+            failed.append({
+                "check": name,
+                "expected": round(computed, 2),
+                "got": round(stored, 2),
+                "diff_pct": round(abs(computed - stored) / max(abs(computed), abs(stored), 1) * 100, 2)
+            })
+
+    if all(k in data for k in ["gross_profit", "revenue", "cost_of_goods_sold"]):
+        check("Gross Profit = Revenue - COGS",
+              data["revenue"] - data["cost_of_goods_sold"],
+              data["gross_profit"])
+
+    if all(k in data for k in ["operating_profit", "gross_profit", "operating_expenses"]):
+        check("Operating Profit = Gross Profit - OpEx",
+              data["gross_profit"] - data["operating_expenses"],
+              data["operating_profit"], tolerance=0.05)
+
+    if all(k in data for k in ["net_profit", "profit_before_tax", "tax_expense"]):
+        check("Net Profit = PBT - Tax",
+              data["profit_before_tax"] - data["tax_expense"],
+              data["net_profit"])
+
+    if all(k in data for k in ["total_assets", "total_liabilities", "total_equity"]):
+        check("Assets = Liabilities + Equity",
+              data["total_liabilities"] + data["total_equity"],
+              data["total_assets"])
+
+    if all(k in data for k in ["total_assets", "current_assets", "non_current_assets"]):
+        check("Total Assets = Current + Non-Current",
+              data["current_assets"] + data["non_current_assets"],
+              data["total_assets"])
+
+    if all(k in data for k in ["total_liabilities", "current_liabilities", "non_current_liabilities"]):
+        check("Total Liabilities = Current + Non-Current",
+              data["current_liabilities"] + data["non_current_liabilities"],
+              data["total_liabilities"])
+
+    if "revenue" in data and "net_profit" in data and data["revenue"] != 0:
+        margin = data["net_profit"] / data["revenue"]
+        if margin > 0.5:
+            warnings.append(f"Net profit margin {margin:.1%} seems unusually high — verify extraction")
+        if margin < -0.5:
+            warnings.append(f"Net profit margin {margin:.1%} seems unusually low — verify extraction")
+
+    if "eps" in data and data["eps"] > 10000:
+        warnings.append(f"EPS of {data['eps']} seems very high — may have been extracted in wrong units")
+
+    return {"passed": passed, "failed": failed, "warnings": warnings}
+
+
+# ── Master extraction function ─────────────────────────────────────────────────
+
+def extract_financials_intelligent(pdf_path: str) -> dict:
+    print(f"📄 Reading PDF: {pdf_path}")
+    pages = extract_pages(pdf_path)
+    full_text = "\n".join(p["text"] for p in pages)
+
+    financial_pages = [p for p in pages if is_financial_page(p["text"])]
+    print(f"   Found {len(financial_pages)} financial pages out of {len(pages)} total")
+
+    all_current = {}
+    all_prior = {}
+    metadata = {
+        "period_current": None,
+        "period_prior": None,
+        "currency": "PKR",
+        "pages_processed": 0,
+        "validation": None
+    }
+
+    for page in financial_pages:
+        print(f"   Processing page {page['page']}...")
+        result = extract_page_with_llm(page["text"])
+
+        if not result:
+            print(f"   ⚠️  Page {page['page']}: LLM extraction failed, skipping")
+            continue
+
+        metadata["pages_processed"] += 1
+
+        if not metadata["period_current"] and result.get("period_current"):
+            metadata["period_current"] = result["period_current"]
+        if not metadata["period_prior"] and result.get("period_prior"):
+            metadata["period_prior"] = result["period_prior"]
+
+        items = result.get("items", {})
+        cur, pri = map_items_to_fields(items)
+
+        for k, v in cur.items():
+            if k not in all_current:
+                all_current[k] = v
+        for k, v in pri.items():
+            if k not in all_prior:
+                all_prior[k] = v
+
+    if all_current:
+        validation = validate_financials(all_current)
+        metadata["validation"] = validation
+
+        print(f"\n📊 Validation results:")
+        print(f"   ✅ Passed: {len(validation['passed'])} checks")
+        if validation["failed"]:
+            print(f"   ❌ Failed: {len(validation['failed'])} checks")
+            for f in validation["failed"]:
+                print(f"      {f['check']}: expected {f['expected']:,.0f}, got {f['got']:,.0f} ({f['diff_pct']}% diff)")
+        if validation["warnings"]:
+            for w in validation["warnings"]:
+                print(f"   ⚠️  {w}")
+
+    return {
+        "current": all_current,
+        "prior": all_prior,
+        "metadata": metadata,
+        "raw_text": full_text
+    }
+
+
+# ── Backwards-compatible wrappers ──────────────────────────────────────────────
+
+def extract_text(pdf_path: str) -> str:
+    return extract_text_only(pdf_path)
+
 
 def extract_financials(text: str) -> dict:
-    """
-    Extract ALL financial fields from raw PDF text.
-    Returns a dict with current-year fields AND prior-year fields prefixed with 'prior_'.
-    """
+    """Legacy regex fallback."""
     data = {}
-
-    # ── Income Statement ──────────────────────────────────────────────────────
-
-    # Revenue: try multiple label variations
-    for label in [
-        r"Net (?:turnover|revenue|sales)\s+" + NUM,
-        r"Gross (?:turnover|revenue|sales)\s+" + NUM,
-        r"(?:Total\s+)?Revenue\s+" + NUM,
-    ]:
-        cur, prior = _find_two(label.replace(NUM, f"{NUM}\\s+{NUM}"), text)
-        if cur is None:
-            cur = _find(label, text)
-        if cur:
-            data["revenue"] = cur
-            if prior:
-                data["prior_revenue"] = prior
-            break
-
-    # Gross profit
-    cur, prior = _find_two(r"Gross profit\s+" + NUM + r"\s+" + NUM, text)
-    if cur is None:
-        cur = _find(r"Gross profit\s+" + NUM, text)
-    if cur:
-        data["gross_profit"] = cur
-        if prior:
-            data["prior_gross_profit"] = prior
-
-    # Operating / EBIT
-    cur, prior = _find_two(r"(?:Operating profit|Profit from operations|EBIT)\s+" + NUM + r"\s+" + NUM, text)
-    if cur is None:
-        cur = _find(r"(?:Operating profit|Profit from operations|EBIT)\s+" + NUM, text)
-    if cur:
-        data["operating_profit"] = cur
-        if prior:
-            data["prior_operating_profit"] = prior
-
-    # PBT
-    cur, prior = _find_two(r"Profit before (?:tax|taxation)\s+" + NUM + r"\s+" + NUM, text)
-    if cur is None:
-        cur = _find(r"Profit before (?:tax|taxation)\s+" + NUM, text)
-    if cur:
-        data["profit_before_tax"] = cur
-        if prior:
-            data["prior_profit_before_tax"] = prior
-
-    # Net profit (PAT)
-    for label in [
-        r"Profit (?:for the (?:period|year)|after tax)\s+" + NUM + r"\s+" + NUM,
-        r"Net profit\s+" + NUM + r"\s+" + NUM,
-    ]:
-        cur, prior = _find_two(label, text)
-        if cur:
-            data["net_profit"] = cur
-            if prior:
-                data["prior_net_profit"] = prior
-            break
-    if "net_profit" not in data:
-        for label in [r"Profit (?:for the (?:period|year)|after tax)\s+" + NUM, r"Net profit\s+" + NUM]:
-            v = _find(label, text)
-            if v:
-                data["net_profit"] = v
-                break
-
-    # EPS
-    cur, prior = _find_two(r"(?:Earnings|EPS|Profit) per share\s+" + NUM + r"\s+" + NUM, text)
-    if cur is None:
-        cur = _find(r"(?:Earnings|EPS|Profit) per share[^\d]+" + NUM, text)
-    if cur:
-        data["eps"] = cur
-        if prior:
-            data["prior_eps"] = prior
-
-    # Dividend per share
-    v = _find(r"(?:Dividend|DPS) per share[^\d]+" + NUM, text)
-    if v:
-        data["dividend_per_share"] = v
-
-    # Cost items
-    for key, patterns in {
-        "cost_of_goods_sold": [r"Cost of (?:goods sold|sales|revenue)\s+" + NUM],
-        "operating_expenses":  [r"(?:Operating|Distribution|Admin(?:istrative)?) expenses\s+" + NUM],
-        "depreciation":        [r"Depreciation\s+" + NUM, r"Depreciation and amortisation\s+" + NUM],
-        "finance_cost":        [r"Finance costs?\s+" + NUM, r"Interest expense\s+" + NUM],
-        "tax_expense":         [r"(?:Income )?[Tt]ax(?:ation)? expense\s+" + NUM, r"Provision for taxation\s+" + NUM],
-    }.items():
-        for pat in patterns:
-            cur, prior = _find_two(pat.replace(NUM, f"{NUM}\\s+{NUM}"), text)
-            if cur is None:
-                cur = _find(pat, text)
-            if cur:
-                data[key] = cur
-                prior_key = f"prior_{key}"
-                if prior:
-                    data[prior_key] = prior
-                break
-
-    # ── Balance Sheet ─────────────────────────────────────────────────────────
-
-    for key, patterns in {
-        "total_assets":            [r"Total assets\s+" + NUM],
-        "current_assets":          [r"Total current assets\s+" + NUM, r"Current assets\s+" + NUM],
-        "non_current_assets":      [r"Total non[- ]?current assets\s+" + NUM, r"Non[- ]?current assets\s+" + NUM],
-        "cash_balance":            [r"Cash and (?:bank )?balances?\s+" + NUM, r"Cash and cash equivalents\s+" + NUM],
-        "trade_receivables":       [r"Trade (?:and other )?receivables\s+" + NUM, r"Trade debtors\s+" + NUM],
-        "inventory":               [r"Inventories\s+" + NUM, r"Stock in trade\s+" + NUM],
-        "total_liabilities":       [r"Total liabilities\s+" + NUM],
-        "current_liabilities":     [r"Total current liabilities\s+" + NUM, r"Current liabilities\s+" + NUM],
-        "non_current_liabilities": [r"Total non[- ]?current liabilities\s+" + NUM],
-        "total_equity":            [r"Total equity\s+" + NUM, r"(?:Shareholders'?|Owners') equity\s+" + NUM],
-        "share_capital":           [r"Share capital\s+" + NUM, r"Paid[- ]?up (?:share )?capital\s+" + NUM],
-        "long_term_debt":          [r"Long[- ]?term (?:debt|borrowings?|financing)\s+" + NUM],
-    }.items():
-        for pat in patterns:
-            cur, prior = _find_two(pat.replace(NUM, f"{NUM}\\s+{NUM}"), text)
-            if cur is None:
-                cur = _find(pat, text)
-            if cur:
-                data[key] = cur
-                if prior:
-                    data[f"prior_{key}"] = prior
-                break
-
-    # ── Cash Flow ─────────────────────────────────────────────────────────────
-
-    for key, patterns in {
-        "operating_cashflow":  [r"Net cash (?:generated from|used in) operating activities\s+" + NUM],
-        "investing_cashflow":  [r"Net cash (?:used in|from) investing activities\s+" + NUM],
-        "financing_cashflow":  [r"Net cash (?:used in|from) financing activities\s+" + NUM],
-    }.items():
-        for pat in patterns:
-            v = _find(pat, text)
-            if v:
-                data[key] = v
-                break
-
-    # ── Metadata ──────────────────────────────────────────────────────────────
-
-    # Company name
-    company_match = re.search(r"^([A-Z][A-Za-z\s]+(?:Limited|Ltd|Company|Corp|PLC))", text, re.MULTILINE)
-    if company_match:
-        data["_company"] = company_match.group(1).strip()
-
-    # Reporting period
+    NUM = r"([\d,]+(?:\.\d+)?)"
+    patterns = {
+        "revenue":           r"Net (?:turnover|revenue|sales)\s+" + NUM,
+        "gross_profit":      r"Gross profit\s+" + NUM,
+        "profit_before_tax": r"Profit before (?:tax|taxation)\s+" + NUM,
+        "net_profit":        r"Profit (?:for the (?:period|year)|after tax)\s+" + NUM,
+        "eps":               r"(?:Earnings|EPS) per share[^\d]+" + NUM,
+        "depreciation":      r"Depreciation\s+" + NUM,
+        "finance_cost":      r"Finance costs?\s+" + NUM,
+        "total_assets":      r"Total assets\s+" + NUM,
+        "total_liabilities": r"Total liabilities\s+" + NUM,
+        "cash_balance":      r"Cash and (?:bank )?balances?\s+" + NUM,
+        "operating_cashflow":r"Net cash generated from operating activities\s+" + NUM,
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data[key] = float(match.group(1).replace(",", ""))
     period_match = re.search(
-        r"(?:for the (?:period|year|quarter)|ended?)\s+(\d{1,2}\s+\w+\s+\d{4}|\w+\s+\d{4}|Q[1-4]\s+\d{4})",
+        r"(?:half year|six month|period|year)\s+ended?\s+(\d{1,2}\s+\w+\s+\d{4}|\w+\s+\d{4})",
         text, re.IGNORECASE
     )
-    if period_match:
-        data["_period"] = period_match.group(1).strip()
-
+    data["_period"] = period_match.group(1).strip() if period_match else "FY 2025"
+    data["_company"] = "Unknown"
     return data
 
 
-# ── CLI entry point ────────────────────────────────────────────────────────────
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
     from db_insert import insert_financials
 
     pdf_path = sys.argv[1] if len(sys.argv) > 1 else "data/Test PDF.pdf"
+    company  = sys.argv[2] if len(sys.argv) > 2 else "Bestway Cement"
 
-    print(f"📄 Extracting from: {pdf_path}")
-    text = extract_text(pdf_path)
-    data = extract_financials(text)
+    result = extract_financials_intelligent(pdf_path)
+    current  = result["current"]
+    prior    = result["prior"]
+    meta     = result["metadata"]
 
-    print("\n📊 Extracted fields:")
-    for k, v in sorted(data.items()):
-        if not k.startswith("_"):
-            print(f"  {k}: {v:,.2f}" if isinstance(v, float) else f"  {k}: {v}")
+    print(f"\n📋 Extracted {len(current)} current fields, {len(prior)} prior fields")
+    print(f"   Period: {meta['period_current']} vs {meta['period_prior']}")
 
-    company = data.get("_company", "Bestway Cement")
-    period  = data.get("_period",  "FY 2025")
-    year    = int(re.search(r"\d{4}", period).group()) if re.search(r"\d{4}", period) else 2025
+    period_str = meta["period_current"] or "31 December 2025"
+    year_match = re.search(r"\d{4}", period_str)
+    year = int(year_match.group()) if year_match else 2025
 
-    # Separate current and prior-year records
-    current = {k: v for k, v in data.items() if not k.startswith("prior_") and not k.startswith("_")}
-    prior   = {k.replace("prior_", ""): v for k, v in data.items() if k.startswith("prior_")}
-
-    insert_financials(current, company=company, year=year, period=period)
-
+    if current:
+        insert_financials(current, company=company, year=year, period=f"H1 FY{year}")
+        print(f"✅ Inserted: {company} H1 FY{year}")
     if prior:
-        insert_financials(prior, company=company, year=year - 1, period=f"FY {year - 1}")
-
-    print("\n✅ Done.")
+        prior_str = meta.get("period_prior", "")
+        prior_year_match = re.search(r"\d{4}", prior_str)
+        prior_year = int(prior_year_match.group()) if prior_year_match else year - 1
+        insert_financials(prior, company=company, year=prior_year, period=f"H1 FY{prior_year}")
+        print(f"✅ Inserted: {company} H1 FY{prior_year}")

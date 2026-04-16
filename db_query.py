@@ -9,6 +9,7 @@ def get_conn():
         _conn = get_connection()
     return _conn
 
+
 def run_query(sql: str):
     try:
         conn = get_conn()
@@ -19,10 +20,6 @@ def run_query(sql: str):
         cur.close()
         return {"columns": colnames, "rows": rows}
     except Exception as e:
-        try:
-            conn.rollback()
-        except:
-            pass
         return {"error": str(e)}
 
 
